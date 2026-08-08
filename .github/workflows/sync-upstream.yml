@@ -1,0 +1,87 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * 1'
+
+# The merge job runs upstream code, so it gets read-only access and no secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  # Merges upstream and runs the tests. Everything here is untrusted: the merged
+  # tree is upstream's code, and test-gorm.sh clones and runs GORM's suite. No
+  # secret is in reach, GITHUB_TOKEN cannot write, and the checkout keeps no
+  # credentials, so nothing this job runs can reach the repository.
+  merge:
+    if: github.repository == 'found-cake/gorm-sqlite'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
+        with:
+          fetch-depth: 0
+          ref: master
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e #v7
+        with:
+          go-version: '1.26'
+      - name: Merge and test
+        env:
+          SYNC_PHASE: merge
+          SYNC_STATE_DIR: ${{ runner.temp }}/sync-state
+          # Read-only: the early-exit checks look for an existing pull request.
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/sync-upstream-simple.sh
+      - name: Upload sync plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7
+        with:
+          name: sync-plan
+          path: ${{ runner.temp }}/sync-state
+          if-no-files-found: error
+          retention-days: 7
+
+  # Pushes the merge and opens the pull request. This job holds the token, so it
+  # must run no code from the merged tree: it only unpacks a git bundle, pushes
+  # it, and calls the API. The script it runs is master's copy, checked out
+  # fresh, never the merged one.
+  publish:
+    needs: merge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [[ -z "$SYNC_TOKEN" ]]; then
+            echo "The SYNC_TOKEN secret is not set." >&2
+            echo "Create a fine-grained token with Contents, Pull requests," >&2
+            echo "Issues and Workflows write access, then store it as SYNC_TOKEN." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7
+        with:
+          fetch-depth: 0
+          ref: master
+          # A branch pushed with GITHUB_TOKEN starts no workflow run, which would
+          # leave every sync pull request without checks. Pushing as SYNC_TOKEN
+          # makes the pull request behave like anyone else's.
+          token: ${{ secrets.SYNC_TOKEN }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8
+        with:
+          name: sync-plan
+          path: ${{ runner.temp }}/sync-state
+      - name: Push the branch and open the pull request
+        env:
+          SYNC_PHASE: publish
+          SYNC_STATE_DIR: ${{ runner.temp }}/sync-state
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: bash .github/scripts/sync-upstream-simple.sh

@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request. Listening to both would run the
+  # whole matrix twice for every sync branch, which is pushed and then opened as
+  # a pull request moments later.
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -10,13 +18,65 @@ jobs:
     strategy:
       matrix:
         go: ['1.26', '1.25', '1.24']
-        platform: [ubuntu-latest] # can not run in windows OS
-    runs-on: ubuntu-latest
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    env:
+      CGO_ENABLED: '0'
     steps:
     - name: Set up Go
-      uses: actions/setup-go@v7
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
       with:
         go-version: ${{ matrix.go }}
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Test
       run: go test -v -cover .
+    - name: Verify dependencies
+      shell: bash
+      run: '! go list -deps ./... | grep -q "github.com/mattn/go-sqlite3"'
+
+  gorm-test:
+    name: GORM test (${{ matrix.platform }}, Go ${{ matrix.go }})
+    strategy:
+      matrix:
+        go: ['1.26', '1.24']
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    env:
+      CGO_ENABLED: '0'
+    steps:
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      with:
+        go-version: ${{ matrix.go }}
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - name: Run GORM tests
+      shell: bash
+      run: bash .github/scripts/test-gorm.sh
+
+  upstream-review:
+    name: Upstream review patches resolved
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+    - name: Fail while an upstream review patch is unresolved
+      shell: bash
+      run: |
+        shopt -s nullglob
+        patches=(.github/upstream-sync-review/*.patch)
+        if (( ${#patches[@]} == 0 )); then
+          echo "No upstream review patch is pending."
+          exit 0
+        fi
+        echo "Unresolved upstream review patches:"
+        printf '  %s\n' "${patches[@]}"
+        cat <<'EOF'
+
+        Each patch holds upstream work the sync discarded, either by preferring
+        the fork hunks or by keeping a file this fork deleted. Nothing in the
+        merged tree shows it, so this check stays red until a human has looked.
+
+        Read the patch and port what still applies -- translator changes belong
+        in error_translator_modernc.go -- then delete the patch to record that
+        it was reviewed.
+        EOF
+        exit 1
