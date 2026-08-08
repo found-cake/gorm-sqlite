@@ -1,13 +1,11 @@
-//go:build cgo
-
 package sqlite
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
 
-	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -22,6 +20,7 @@ func openTranslating(t *testing.T, dsn string) *gorm.DB {
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
+	closeGORM(t, db)
 	return db
 }
 
@@ -66,7 +65,7 @@ func TestTranslateDuplicatedKeyOnPrimaryKey(t *testing.T) {
 }
 
 func TestTranslateForeignKeyViolated(t *testing.T) {
-	db := openTranslating(t, "file:translate_fk?mode=memory&cache=shared&_foreign_keys=on")
+	db := openTranslating(t, "file:translate_fk?mode=memory&cache=shared&_pragma=foreign_keys(1)")
 
 	if err := db.Exec("CREATE TABLE authors (id integer primary key)").Error; err != nil {
 		t.Fatalf("failed to create authors: %v", err)
@@ -83,10 +82,7 @@ func TestTranslateForeignKeyViolated(t *testing.T) {
 
 func TestTranslateWrappedError(t *testing.T) {
 	dialector := Dialector{}
-	sqliteErr := sqlite3.Error{
-		Code:         sqlite3.ErrConstraint,
-		ExtendedCode: sqlite3.ErrConstraintUnique,
-	}
+	sqliteErr := duplicateKeyError(t)
 
 	if err := dialector.Translate(sqliteErr); !errors.Is(err, gorm.ErrDuplicatedKey) {
 		t.Errorf("expected gorm.ErrDuplicatedKey, got: %v", err)
@@ -95,10 +91,6 @@ func TestTranslateWrappedError(t *testing.T) {
 	wrapped := fmt.Errorf("inserting article: %w", sqliteErr)
 	if err := dialector.Translate(wrapped); !errors.Is(err, gorm.ErrDuplicatedKey) {
 		t.Errorf("expected a wrapped error to be translated to gorm.ErrDuplicatedKey, got: %v", err)
-	}
-
-	if err := dialector.Translate(&sqliteErr); !errors.Is(err, gorm.ErrDuplicatedKey) {
-		t.Errorf("expected a pointer error to be translated to gorm.ErrDuplicatedKey, got: %v", err)
 	}
 }
 
@@ -123,14 +115,58 @@ func TestTranslateLeavesForeignErrorTypesAlone(t *testing.T) {
 
 func TestTranslateUnmappedCode(t *testing.T) {
 	dialector := Dialector{}
-	sqliteErr := sqlite3.Error{
-		Code:         sqlite3.ErrConstraint,
-		ExtendedCode: sqlite3.ErrConstraintNotNull,
-	}
+	sqliteErr := notNullError(t)
 
 	if err := dialector.Translate(sqliteErr); !errors.Is(err, sqliteErr) {
 		t.Errorf("expected an unmapped code to be returned untouched, got: %v", err)
 	}
+}
+
+func duplicateKeyError(t *testing.T) error {
+	t.Helper()
+
+	db := openRawDatabase(t)
+	if _, err := db.Exec("CREATE TABLE articles (article_number TEXT UNIQUE)"); err != nil {
+		t.Fatalf("failed to create articles: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO articles VALUES ('A00000XX')"); err != nil {
+		t.Fatalf("failed to insert first article: %v", err)
+	}
+	_, err := db.Exec("INSERT INTO articles VALUES ('A00000XX')")
+	if err == nil {
+		t.Fatal("expected duplicate insert to fail")
+	}
+	return err
+}
+
+func notNullError(t *testing.T) error {
+	t.Helper()
+
+	db := openRawDatabase(t)
+	if _, err := db.Exec("CREATE TABLE required_values (value TEXT NOT NULL)"); err != nil {
+		t.Fatalf("failed to create required_values: %v", err)
+	}
+	_, err := db.Exec("INSERT INTO required_values DEFAULT VALUES")
+	if err == nil {
+		t.Fatal("expected not-null insert to fail")
+	}
+	return err
+}
+
+func openRawDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open(DriverName, ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open raw database: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("failed to close raw database: %v", err)
+		}
+	})
+	return db
 }
 
 func TestTranslateNonSQLiteError(t *testing.T) {
