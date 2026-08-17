@@ -38,7 +38,7 @@ jobs:
     name: GORM test (${{ matrix.platform }}, Go ${{ matrix.go }})
     strategy:
       matrix:
-        go: ['1.26', '1.25', '1.24']
+        go: ['1.26', '1.25']
         platform: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
     env:
